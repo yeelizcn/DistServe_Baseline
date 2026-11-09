@@ -41,7 +41,9 @@ class ParaWorker:
         parallel_config: ParallelConfig = ParallelConfig(),
         tensor_parallel_id: List[int] = None,   # Although the type is list[int], it is actually a NCCL unique ID
         pipeline_parallel_id: List[int] = None, # Same as above
+        cross_node=None,
     ) -> None:
+        self.cross_node = cross_node
         self.worker_id = worker_id
         self.stage = stage
         self.model = None
@@ -53,6 +55,10 @@ class ParaWorker:
         self.gpu_id = ray.get_gpu_ids()[0]
         
         self.device = torch.device(f"cuda:0")
+        if cross_node:
+            expected = "A6000" if stage == Stage.CONTEXT else "A5000"
+            if expected not in torch.cuda.get_device_name(0):
+                raise RuntimeError(f"Wrong GPU for {stage}: expected {expected}")
         torch.cuda.set_device(self.device)
         
         # K/V cache on GPU
@@ -73,6 +79,50 @@ class ParaWorker:
         # Statistics
         self.execution_time = 0.0
         self.blocked_swapping_time = 0.0
+
+    def init_transfer(self, rank, config):
+        from datetime import timedelta
+        torch.distributed.init_process_group(
+            backend="nccl", init_method=config["init_method"], rank=rank,
+            world_size=4, timeout=timedelta(seconds=config["timeout_s"]))
+        self.transfer_rank = rank
+        # Initialize communicator collectively before pairwise traffic.
+        probe = torch.zeros(1, device=self.device)
+        torch.distributed.all_reduce(probe)
+        torch.cuda.synchronize()
+
+    def transfer_metadata(self):
+        return (tuple(self.k_cache.shape[1:]), str(self.k_cache.dtype),
+                {k: v for k, v in self.model_config.hf_config.to_dict().items()
+                 if k not in ("_name_or_path", "transformers_version")})
+
+    def prepare_transfer_probe(self):
+        # Called before any request allocation; block zero is still free.
+        value = self.transfer_rank + 1 if self.transfer_rank < 2 else 0
+        self.k_cache[0].fill_(value)
+        self.v_cache[0].fill_(value + 10 if value else 0)
+        torch.cuda.synchronize()
+
+    def check_transfer_probe(self):
+        expected = self.transfer_rank - 1
+        if not bool((self.k_cache[0] == expected).all()) or not bool((self.v_cache[0] == expected + 10).all()):
+            raise RuntimeError("NCCL KV probe content mismatch")
+        return True
+
+    def transfer_blocks(self, blocks, sending):
+        if not self.cross_node or sending != (self.transfer_rank < 2):
+            raise RuntimeError("Invalid transfer role")
+        if len(set(blocks)) != len(blocks) or any(b < 0 or b >= len(self.k_cache) for b in blocks):
+            raise ValueError("Invalid KV block indices")
+        peer = self.transfer_rank + 2 if sending else self.transfer_rank - 2
+        # One block at a time bounds staging memory independently of prompt length.
+        for block in blocks:
+            for cache in (self.k_cache, self.v_cache):
+                if sending:
+                    torch.distributed.send(cache[block].contiguous(), dst=peer)
+                else:
+                    torch.distributed.recv(cache[block], src=peer)
+        torch.cuda.synchronize()
 
     def ready(self):
         """
@@ -130,6 +180,8 @@ class ParaWorker:
         )
         torch.cuda.synchronize()
         
+        if self.cross_node:
+            return None
         return torch.ops.block_migration_ops.get_ipc_mem_handle(self.k_cache), \
                torch.ops.block_migration_ops.get_ipc_mem_handle(self.v_cache)
 
@@ -168,6 +220,11 @@ class ParaWorker:
                 parallel_config=self.parallel_config
             )
         )
+        if self.model_config.hf_config.model_type == "qwen2":
+            free, total = torch.cuda.mem_get_info()
+            # Raw CUDA allocations in SwiftTransformer are not tracked by torch's allocator.
+            # Leave 2 GiB plus the configured unused fraction for activations/NCCL.
+            peak_runtime_memory = total - free + 2 * GB
         logger.info(f"runtime peak memory: {peak_runtime_memory / GB:.3f} GB")
         logger.info(f"total GPU memory: {total_gpu_memory / GB:.3f} GB")
         block_size_in_bytes = self._get_block_size_in_bytes(

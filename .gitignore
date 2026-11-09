@@ -8,8 +8,13 @@
 # Ignore profile database
 profile_database
 
-# Ignore /SwiftTransformer
-/SwiftTransformer
+# Keep the adapted backend source; exclude build outputs and fetched dependencies.
+/SwiftTransformer/build/
+/SwiftTransformer/src/csrc/kernel/xformers/
+/deployment/*.local.json
+/.reproduction-work/
+/复现指导/复现实验日志.修改前备份.docx
+/复现指导/复现实验日志.NCCL改造前备份.docx
 
 # Ignore .vscode
 **/.vscode

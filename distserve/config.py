@@ -78,7 +78,12 @@ class DisaggParallelConfig:
         self,
         context: ParallelConfig,
         decoding: ParallelConfig,
+        cross_node: Optional[dict] = None,
     ) -> None:
+        self.cross_node = cross_node
+        if cross_node is not None:
+            from distserve.cross_node import validate_config
+            validate_config(cross_node, context, decoding)
         self.context = context
         self.decoding = decoding
     

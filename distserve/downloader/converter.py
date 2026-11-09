@@ -161,9 +161,26 @@ def preprocess_gpt2(tensor_dict: Dict[str, torch.Tensor])\
     assert num_q_heads > 0, "num_q_heads must be greater than 0"
     return tensor_dict, num_q_heads, head_dim
 
+def preprocess_qwen2(tensor_dict):
+    # Keep HF half-split RoPE ordering; backend has a matching Qwen kernel path.
+    prefix = "model." if any(k.startswith("model.layers.") for k in tensor_dict) else ""
+    layers = sorted({int(k.split("layers.")[1].split(".")[0])
+                     for k in tensor_dict if k.endswith("self_attn.q_proj.bias")})
+    if not layers:
+        raise ValueError("Qwen QKV biases are missing")
+    biases = {}
+    for i in layers:
+        biases[f"decoder.layers.{i}.self_attn.qkv_proj.bias"] = torch.cat([
+            tensor_dict.pop(f"{prefix}layers.{i}.self_attn.{kind}_proj.bias")
+            for kind in ("q", "k", "v")])
+    tensors, heads, dim = preprocess_llama2(tensor_dict)
+    tensors.update(biases)
+    return tensors, heads, dim
+
 PREPROCESSOR = {
     "opt": preprocess_opt,
     "llama": preprocess_llama2,
+    "qwen2": preprocess_qwen2,
     "gpt2": preprocess_gpt2
 }
 
@@ -282,9 +299,15 @@ def gpt2NameTranslator(name: str) -> Optional[str]:
             return newname.format(**match.groupdict())
     assert False, f"Cannot find a match for {name} when translating name"
 
+def qwen2NameTranslator(name):
+    if name.startswith("decoder.layers.") and name.endswith("qkv_proj.bias"):
+        return name
+    return llama2NameTranslator(name)
+
 NAME_TRANSLATOR = {
     "opt": optNameTranslator,
     "llama": llama2NameTranslator,
+    "qwen2": qwen2NameTranslator,
     "gpt2": gpt2NameTranslator
 }
 
@@ -312,7 +335,8 @@ def divideWeightAndSave(
     tensor_dict: Dict[str, torch.Tensor], 
     name_translator: Callable[[str], Optional[str]], 
     num_q_heads: int, 
-    head_dim: int
+    head_dim: int,
+    num_shards: int = 8
 ):
     """The last step in convertWeight(). It takes a tensor_dict and a name 
     translator, translate the names of the weights, divide the weights and 
@@ -321,8 +345,8 @@ def divideWeightAndSave(
     def divideTensorAndStore(new_key, value, dim: int):
         """divide a tensor along a dimension into 8 pieces and save the divided 
         tensors to files"""
-        assert value.size(dim) % 8 == 0, f"Cannot divide {new_key} along dim={dim} because the size of the dimension is not divisible by 8"
-        value = torch.split(value, value.size(dim) // 8, dim=dim)
+        assert value.size(dim) % num_shards == 0, f"Cannot divide {new_key} along dim={dim} because the size of the dimension is not divisible by 8"
+        value = torch.split(value, value.size(dim) // num_shards, dim=dim)
         # save the tensor to file
         for i in range(len(value)):
             filename = os.path.join(output_dir, f"{new_key}.tp_{i}.pt")
@@ -336,8 +360,8 @@ def divideWeightAndSave(
         # or, [(num_q_heads+2*num_kv_heads), head_dim] (when converting QKV bias)
 
         # Deal with cases where num_q_heads or num_kv_heads is not divisible by 8, like in OPT-125M
-        q_heads_in_each_tensor = num_q_heads // 8 if num_q_heads%8 == 0 else [ num_q_heads // 8 ] * 7 + [ num_q_heads - (num_q_heads // 8) * 7 ]
-        kv_heads_in_each_tensor = num_kv_heads // 8 if num_kv_heads%8 == 0 else [ num_kv_heads // 8 ] * 7 + [ num_kv_heads - (num_kv_heads // 8) * 7 ]
+        q_heads_in_each_tensor = num_q_heads // num_shards if num_q_heads%num_shards == 0 else [ num_q_heads // num_shards ] * (num_shards - 1) + [ num_q_heads - (num_q_heads // num_shards) * (num_shards - 1) ]
+        kv_heads_in_each_tensor = num_kv_heads // num_shards if num_kv_heads%num_shards == 0 else [ num_kv_heads // num_shards ] * (num_shards - 1) + [ num_kv_heads - (num_kv_heads // num_shards) * (num_shards - 1) ]
 
         # split qkvs into 3 parts: q, k, v
         qs = qkvs.narrow(split_dim, 0, num_q_heads).split(q_heads_in_each_tensor, split_dim)
@@ -345,7 +369,7 @@ def divideWeightAndSave(
         vs = qkvs.narrow(split_dim, num_q_heads+num_kv_heads, num_kv_heads).split(kv_heads_in_each_tensor, split_dim)
 
         # save the tensors to files
-        for i in range(8):
+        for i in range(num_shards):
             filename = os.path.join(output_dir, f"{key}.tp_{i}.pt")
             saveTensorToFile(filename, key, torch.cat([qs[i], ks[i], vs[i]], dim=split_dim))
 
@@ -355,15 +379,15 @@ def divideWeightAndSave(
 
     # Tensors that need to be divided along dim=0
     to_divide_by_dim0_regex = re.compile("|".join([
-        "decoder.layers.(\d+).fc1.weight",      # [ffn_inter_dim, hidden_size]
-        "decoder.layers.(\d+).fc1.bias",        # [ffn_inter_dim]
-        "decoder.layers.(\d+).fc3.weight",      # [ffn_inter_dim, hidden_size]
-        "decoder.layers.(\d+).self_attn.out_proj.weight",   # [(num_q_heads*head_dim), hidden_size]
-        "decoder.layers.(\d+).self_attn.qkv_proj.bias"      # [(num_q_heads+2*num_kv_heads)*head_dim]
+        r"decoder.layers.(\d+).fc1.weight",      # [ffn_inter_dim, hidden_size]
+        r"decoder.layers.(\d+).fc1.bias",        # [ffn_inter_dim]
+        r"decoder.layers.(\d+).fc3.weight",      # [ffn_inter_dim, hidden_size]
+        r"decoder.layers.(\d+).self_attn.out_proj.weight",   # [(num_q_heads*head_dim), hidden_size]
+        r"decoder.layers.(\d+).self_attn.qkv_proj.bias"      # [(num_q_heads+2*num_kv_heads)*head_dim]
                                          ]))
     # Tensors that need to be divided along dim=1
     to_divide_by_dim1_regex = re.compile("|".join([
-        "decoder.layers.(\d+).fc2.weight"       # [hidden_size, ffn_inter_dim]
+        r"decoder.layers.(\d+).fc2.weight"       # [hidden_size, ffn_inter_dim]
                                          ]))
     # Tensors that need to be replicated among all tensor parallel workers
     to_replicate_regex = re.compile("|".join([
@@ -371,10 +395,10 @@ def divideWeightAndSave(
         "decoder.embed_positions.weight",       # [max_positions, hidden_size]
         "decoder.output_projection.weight",     # [vocab_size, hidden_size]
         "decoder.layer_norm.(weight|bias)",     # [hidden_size] (The final layernorm)
-        "decoder.layers.(\d+).self_attn_layer_norm.(weight|bias)",  # [hidden_size]
-        "decoder.layers.(\d+).final_layer_norm.(weight|bias)",      # [hidden_size]
-        "decoder.layers.(\d+).self_attn.out_proj.bias",             # [hidden_size]
-        "decoder.layers.(\d+).fc2.bias"                    # [hidden_size]
+        r"decoder.layers.(\d+).self_attn_layer_norm.(weight|bias)",  # [hidden_size]
+        r"decoder.layers.(\d+).final_layer_norm.(weight|bias)",      # [hidden_size]
+        r"decoder.layers.(\d+).self_attn.out_proj.bias",             # [hidden_size]
+        r"decoder.layers.(\d+).fc2.bias"                    # [hidden_size]
                                     ]))
     
     # And we have two special tensors:
@@ -420,7 +444,7 @@ def convert_weights(
     # Load the state dict (tensor_dict)
     # If the whole model is saved in a single file, then load the state dict directly
     # otherwise, load them separately and merge them into a single state dict
-    bin_files = glob(os.path.join(input, '*.bin'))
+    bin_files = sorted(glob(os.path.join(input, "*.safetensors"))) or sorted(glob(os.path.join(input, "*.bin")))
     #logger.info(f"Find bin files : {bin_files}.") 
     #input_files = glob(input)
     if len(bin_files) == 0:
@@ -432,7 +456,14 @@ def convert_weights(
     state_dict = {}
     for file in bin_files:
         print(f"Loading {file}")
-        state_dict.update(torch.load(file, torch.device("cpu")))
+        if file.endswith(".safetensors"):
+            from safetensors.torch import load_file
+            shard = load_file(file, device="cpu")
+        else:
+            shard = torch.load(file, map_location="cpu", weights_only=True)
+        if state_dict.keys() & shard.keys():
+            raise ValueError("Duplicate weight names across shards")
+        state_dict.update(shard)
 
     # Change dtype
     for key in state_dict:
@@ -446,7 +477,7 @@ def convert_weights(
     # The final step: divide the weights and save them to files
     print("Resharding and saving weights")
     name_translator = NAME_TRANSLATOR[model]
-    divideWeightAndSave(output, tensor_dict, name_translator, num_q_heads, head_dim)
+    divideWeightAndSave(output, tensor_dict, name_translator, num_q_heads, head_dim, 2 if model == "qwen2" else 8)
     
 #######################
 #    CLI Interface    #

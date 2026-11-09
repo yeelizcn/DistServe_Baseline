@@ -9,10 +9,10 @@ import ray
 from ray.util.placement_group import PlacementGroup
 
 from distserve.config import (
-    ModelConfig, 
-    DisaggParallelConfig, 
-    ParallelConfig, 
-    CacheConfig, 
+    ModelConfig,
+    DisaggParallelConfig,
+    ParallelConfig,
+    CacheConfig,
     ContextStageSchedConfig,
     DecodingStageSchedConfig
 )
@@ -43,7 +43,7 @@ class LLMEngine:
     This class, LLMEngine, receives requests from upper wrapper class and provides
     interface LLMEngine.generate() that yields the generated tokens for each request.
 
-    It supports the feature of "disaggregate", which basically means to run 
+    It supports the feature of "disaggregate", which basically means to run
     the context stage and the decoding stage on different GPUs to avoid interference.
 
     ## Implementation
@@ -68,7 +68,7 @@ class LLMEngine:
       - The "bridge" queue, which contains all the requests that have just finished
         the context stage but have not been accepted by the decoding stage.
         (Producer: context stage event loop, Consumer: decoding stage event loop)
-      
+
     Two event loops are executed concurrently and endlessly:
       - Context stage event loop. This event loop fetches requests from the waiting
         queue, forwards them to the context stage, and then puts them into the
@@ -102,12 +102,17 @@ class LLMEngine:
             tokenizer_mode=model_config.tokenizer_mode,
             trust_remote_code=model_config.trust_remote_code,
         )
-        
+
         self.bridge_queue = asyncio.Queue()
-        
+
         logger.info("Initializing placement group")
-        placement_groups = self._init_placement_groups()
-        
+        self.cross_node = disagg_parallel_config.cross_node
+        if self.cross_node:
+            from distserve.cross_node import create_placement_groups
+            context_groups, decoding_groups = create_placement_groups(self.cross_node)
+        else:
+            context_groups = decoding_groups = self._init_placement_groups()
+
         logger.info("Initializing context stage LLM engine")
         self.context_engine = ContextStageLLMEngine(
             self.bridge_queue,
@@ -115,11 +120,11 @@ class LLMEngine:
             disagg_parallel_config.context,
             cache_config,
             context_sched_config,
-            placement_groups,
+            context_groups,
             self._on_new_step_output_callback,
             self._on_new_lifetime_event_callback
         )
-        
+
         logger.info("Initializing decoding stage LLM engine")
         self.decoding_engine = DecodingStageLLMEngine(
             self.bridge_queue,
@@ -127,32 +132,37 @@ class LLMEngine:
             disagg_parallel_config.decoding,
             cache_config,
             decoding_sched_config,
-            placement_groups,
+            decoding_groups,
             self.context_engine.clear_migrated_blocks_callback,
             self._on_new_step_output_callback,
             self._on_new_lifetime_event_callback
         )
-        
+
+        if self.cross_node:
+            self.context_engine.cross_node = self.cross_node
+            self.decoding_engine.cross_node = self.cross_node
+            self.decoding_engine.source_workers = self.context_engine
+
         # request_id -> list of StepOutput
         # Created when calling self.generate()
         # Cleared when the request is finished
         self.request_outputs: Dict[int, asyncio.Queue[StepOutput]] = {}
-        
+
         # request_id -> list of LifetimeEvent
         # Created when calling self.generate()
         # Cleared by the caller of self.generate() (i.e. the engine does not clear that)
         # TODO: clear this automatically to avoid memory leak
         self.request_lifetime_events: Dict[int, List[LifetimeEvent]] = {}
-        
+
         self.engine_initialized = False
-    
+
     def _on_new_step_output_callback(self, request_id: int, step_output: StepOutput):
         """
         Called by self.context_engine or self.decoding_engine when a new output token
         is generated
         """
         self.request_outputs[request_id].put_nowait(step_output)
-        
+
     def _on_new_lifetime_event_callback(self, request_id: int, event: LifetimeEvent, dont_add_if_dup: bool = False):
         """
         Called by self.context_engine or self.decoding_engine when a new lifetime event
@@ -164,11 +174,11 @@ class LLMEngine:
                 self.request_lifetime_events[request_id][-1].event_type == event.event_type:
             return
         self.request_lifetime_events[request_id].append(event)
-    
+
     def _init_placement_groups(self) -> Optional[List[PlacementGroup]]:
         """
         Create placement groups for all engines and all workers
-        
+
         Currently we force the same layer of the context & decoding stage to be executed
         on the same node (we call this "aligned"). This simplifies k/v cache migration.
         """
@@ -176,22 +186,22 @@ class LLMEngine:
         context_tp = self.disagg_parallel_config.context.tensor_parallel_size
         decoding_pp = self.disagg_parallel_config.decoding.pipeline_parallel_size
         decoding_tp = self.disagg_parallel_config.decoding.tensor_parallel_size
-        
+
         # Each placement group is responsible for `layer_per_placement_group` layers
         layer_per_context_pp = self.model_config.get_num_layers(self.disagg_parallel_config.context)
         layer_per_decoding_pp = self.model_config.get_num_layers(self.disagg_parallel_config.decoding)
         layer_per_placement_group = math.lcm(layer_per_context_pp, layer_per_decoding_pp)
-        
+
         # Each placement group contains `workers_per_placement_group` workers
         workers_per_placement_group = \
             layer_per_placement_group // layer_per_context_pp * context_tp \
             + layer_per_placement_group // layer_per_decoding_pp * decoding_tp
-        
+
         # There should be `num_placement_groups` placement groups in total
         num_placement_groups = self.model_config.get_num_layers() // layer_per_placement_group
         assert num_placement_groups * workers_per_placement_group == \
             context_pp * context_tp + decoding_pp * decoding_tp
-        
+
         # Create placement groups
         placement_groups = []
         for i in range(num_placement_groups):
@@ -201,23 +211,36 @@ class LLMEngine:
             )
             ray.get(placement_group.ready(), timeout=1000)
             placement_groups.append(placement_group)
-        
+
         return placement_groups
-        
+
     async def initialize(self):
         await asyncio.gather(
             self.context_engine.initialize(),
             self.decoding_engine.initialize()
         )
-        await self.decoding_engine.register_kvcache_mem_handles(
-            self.context_engine.parallel_config,
-            self.context_engine.kv_cache_mem_handles
-        )
+        if self.cross_node:
+            workers = self.context_engine.workers[0] + self.decoding_engine.workers[0]
+            await asyncio.gather(*(w.init_transfer.remote(i, self.cross_node)
+                                   for i, w in enumerate(workers)))
+            metadata = await asyncio.gather(*(w.transfer_metadata.remote() for w in workers))
+            if any(m != metadata[0] for m in metadata[1:]):
+                raise RuntimeError(f"Incompatible KV metadata: {metadata}")
+            await asyncio.gather(*(w.prepare_transfer_probe.remote() for w in workers))
+            await asyncio.gather(*(w.transfer_blocks.remote([0], i < 2)
+                                   for i, w in enumerate(workers)))
+            await asyncio.gather(*(w.check_transfer_probe.remote() for w in workers[2:]))
+            logger.info("Cross-node NCCL KV probe passed on both TP ranks")
+        else:
+            await self.decoding_engine.register_kvcache_mem_handles(
+                self.context_engine.parallel_config,
+                self.context_engine.kv_cache_mem_handles
+            )
         self.engine_initialized = True
-        
+
     def _remote_call_all_workers(
-        self, 
-        func_name: str, 
+        self,
+        func_name: str,
         *args
     ):
         """
@@ -227,7 +250,7 @@ class LLMEngine:
         return ray.get(handlers)
 
     def _remote_call_all_workers_async(
-        self, 
+        self,
         func_name: str,
         *args
     ):
@@ -240,7 +263,7 @@ class LLMEngine:
 
     async def _start_my_event_loop(self):
         pass
-    
+
     async def start_all_event_loops(self):
         """
         start_all_event_loops: Start context_engine's, decoding_engine's, and
@@ -253,7 +276,7 @@ class LLMEngine:
             self.decoding_engine.start_event_loop(),
             self._start_my_event_loop()
         )
-        
+
     async def generate(
         self,
         prompt: Optional[str],
@@ -264,7 +287,7 @@ class LLMEngine:
     ) -> AsyncGenerator[StepOutput, None]:
         """
         generate - Generate outputs for one request
-        
+
         This function is intended to be used as an async generator, i.e., it can be
         used in a for loop. For example, `async for output in engine.generate(...)`
         """
@@ -280,10 +303,10 @@ class LLMEngine:
         )
         self.request_outputs[req.request_id] = asyncio.Queue()
         self.request_lifetime_events[req.request_id] = []
-        
+
         self._on_new_lifetime_event_callback(req.request_id, LifetimeEvent(LifetimeEventType.Issued))
         self.context_engine.add_request(req)
-        
+
         while True:
             try:
                 step_output = await self.request_outputs[req.request_id].get()
@@ -296,39 +319,39 @@ class LLMEngine:
             yield step_output
             if step_output.is_finished:
                 break
-                
+
         del self.request_outputs[req.request_id]
 
     def abort_request(self, request_id: int):
         self.context_engine.abort_request(request_id)
         self.decoding_engine.abort_request(request_id)
-        
+
 def add_engine_cli_args(parser: argparse.ArgumentParser):
     parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--tokenizer", type=str, default=None)
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--use-dummy-weights", action="store_true")
-    
+
     parser.add_argument("--context-pipeline-parallel-size", type=int, default=1)
     parser.add_argument("--context-tensor-parallel-size", type=int, default=1)
     parser.add_argument("--decoding-pipeline-parallel-size", type=int, default=1)
     parser.add_argument("--decoding-tensor-parallel-size", type=int, default=1)
-    
+
     parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument("--max-num-blocks-per-req", type=int, default=256)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--swap-space", type=int, default=16)
-    
+
     parser.add_argument("--context-sched-policy", type=str, default="fcfs")
     parser.add_argument("--context-max-batch-size", type=int, default=256)
     parser.add_argument("--context-max-tokens-per-batch", type=int, default=4096)
-    
+
     parser.add_argument("--decoding-sched-policy", type=str, default="fcfs")
     parser.add_argument("--decoding-max-batch-size", type=int, default=256)
     parser.add_argument("--decoding-max-tokens-per-batch", type=int, default=8192)
-    
+
     parser.add_argument("--simulator-mode", action="store_true")
     parser.add_argument("--profiler-data-path", type=str, default=None)
     parser.add_argument("--gpu-mem-size-gb", type=float, default=None)
-    
+

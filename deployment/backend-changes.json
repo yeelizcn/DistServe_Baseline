@@ -1,0 +1,20 @@
+{
+  "verified_upstream_blobs": 131,
+  "modified": [
+    "src/csrc/kernel/fused_context_stage_attention.cu",
+    "src/csrc/kernel/fused_decoding_stage_attention.cu",
+    "src/csrc/kernel/rotary_posi_embedding.cu",
+    "src/csrc/kernel/rotary_posi_embedding.h",
+    "src/csrc/layer/attention.cc",
+    "src/csrc/layer/attention.h",
+    "src/csrc/model/gpt/gpt.cc",
+    "src/csrc/model/gpt/gpt_hyper_param.h",
+    "src/csrc/model/gpt/gpt_weight.cc",
+    "src/csrc/model/gpt/llama2/CMakeLists.txt",
+    "src/csrc/pybinding.cc"
+  ],
+  "added": [
+    "src/csrc/model/gpt/llama2/qwen2op.h",
+    "src/csrc/model/gpt/llama2/qwen2op.cc"
+  ]
+}

@@ -29,7 +29,8 @@ DISTSERVE_CACHE = os.getenv("DISTSERVE_CACHE", default_cache)
 MODEL_REGISTRY = {
     "opt",
     "llama",
-    "gpt2"
+    "gpt2",
+    "qwen2"
 }
 
 def repo_folder_name(*, repo_id: str, repo_type: str = "model") -> str:
@@ -112,7 +113,9 @@ def download_and_convert_weights(model_config: ModelConfig) -> str:
         is_local = os.path.isdir(model_name_or_path)
         
         # if the model weights have already been downloaded and converted before
-        cache_dir = DISTSERVE_CACHE
+        if model == "qwen2" and not is_local:
+            raise ValueError("Qwen requires a local, revision-pinned HF snapshot")
+        cache_dir = os.path.join(DISTSERVE_CACHE, "qwen2-v1") if model == "qwen2" else DISTSERVE_CACHE
         storage_folder = \
             os.path.join(cache_dir, 
                         repo_folder_name(repo_id=model_name_or_path)) + '/'

@@ -1,5 +1,15 @@
 # DistServe
 
+## 本仓库：双节点 Qwen2.5 Baseline 适配
+
+基于 LLMServe/DistServe，目标是两张 A6000 执行 Prefill、两张 A5000 执行 Decode，使用 Qwen/Qwen2.5-7B-Instruct。新增固定双节点放置、NCCL KV Cache 传输和 SwiftTransformer Qwen 执行支持。
+
+**验证状态：CPU 测试通过；尚未完成 Linux/CUDA 编译、真实 NCCL 通信和模型数值验收。不能视为已经跑通的性能复现结果。**
+
+请先阅读 [双节点部署说明](deployment/README.md)。修改后的后端源码位于 `SwiftTransformer/`，不要用下面原版说明中的再次克隆操作覆盖它。实验记录位于 `复现指导/复现实验日志.docx`。
+
+以下保留上游项目介绍与原版使用说明。
+
 DistServe improves the performance of large language models (LLMs) serving by disaggregating the prefill and decoding
 computation. Existing LLM serving systems colocate the two
 phases and batch the computation of prefill and decoding

@@ -1,0 +1,14 @@
+{
+  "model_id": "Qwen/Qwen2.5-7B-Instruct",
+  "revision": null,
+  "model_path": null,
+  "ray_address": null,
+  "cross_node": {
+    "prefill_node_id": null,
+    "decode_node_id": null,
+    "init_method": null,
+    "timeout_s": 180
+  },
+  "max_tokens": 32,
+  "max_context": 2048
+}

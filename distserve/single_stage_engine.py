@@ -174,6 +174,7 @@ class SingleStageLLMEngine(ABC):
                     stage=self.stage,
                     model_config=self.model_config,
                     cache_config=self.cache_config,
+                    cross_node=getattr(self, "cross_node", None),
                     parallel_config=tmp_parallel_config,
                     pipeline_parallel_id=pp_id,
                     tensor_parallel_id=tp_id,
@@ -182,25 +183,27 @@ class SingleStageLLMEngine(ABC):
                 init_handlers.append(worker.ready.remote())
             self.workers.append(workers)
             
-        await asyncio.wait(init_handlers)
+        await asyncio.gather(*init_handlers)
 
     async def _init_model(self):
         """
         init model by call init_model() on all workers
         """
         handlers = self._remote_call_all_workers_async("init_model")
-        await asyncio.wait(handlers)
+        await asyncio.gather(*handlers)
 
     async def _init_kvcache(self):
         """
         Profile available blocks and initialize k/v cache on all workers
         """
         logger.info("Profiling available blocks")
-        num_gpu_blocks, num_cpu_blocks = await self.workers[0][0]._profile_num_available_blocks.remote(
-            self.cache_config.block_size,
-            self.cache_config.gpu_memory_utilization,
-            self.cache_config.cpu_swap_space,
-        )
+        profiles = await asyncio.gather(*self._remote_call_all_workers_async(
+            "_profile_num_available_blocks", self.cache_config.block_size,
+            self.cache_config.gpu_memory_utilization, self.cache_config.cpu_swap_space))
+        num_gpu_blocks = min(p[0] for p in profiles)
+        num_cpu_blocks = min(p[1] for p in profiles)
+        if num_gpu_blocks < self.cache_config.max_num_blocks_per_req:
+            raise RuntimeError("Insufficient KV blocks for one maximum-length request")
             
         logger.info(f"Profiling result: num_gpu_blocks: {num_gpu_blocks}, num_cpu_blocks: {num_cpu_blocks}")
         if self.stage == Stage.CONTEXT:
@@ -476,7 +479,7 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
         register those handles.
         """
         self.kv_cache_mem_handles = kv_cache_mem_handles
-        await asyncio.wait(self._remote_call_all_workers_async(
+        await asyncio.gather(*self._remote_call_all_workers_async(
             "register_kvcache_mem_handles",
             context_parallel_config,
             kv_cache_mem_handles
@@ -521,12 +524,22 @@ class DecodingStageLLMEngine(SingleStageLLMEngine):
             migrating_req.req.request_id,
             LifetimeEvent(LifetimeEventType.MigrationBegin)
         )
-        await asyncio.wait(self._remote_call_all_workers_async(
-            "migrate_blocks",
-            migrating_req.block_indexes,
-            migrating_req.context_parallel_config,
-            target_block_indexes
-        ))
+        if getattr(self, "cross_node", None):
+            # Scheduler initiates pull. Never free source blocks until ALL ranks finish.
+            if not hasattr(self, "transfer_lock"):
+                self.transfer_lock = asyncio.Lock()
+            async with self.transfer_lock:
+                calls = []
+                for rank in range(2):
+                    calls.append(self.source_workers.workers[0][rank].transfer_blocks.remote(
+                        migrating_req.block_indexes, True))
+                    calls.append(self.workers[0][rank].transfer_blocks.remote(
+                        target_block_indexes, False))
+                await asyncio.gather(*calls)
+        else:
+            await asyncio.gather(*self._remote_call_all_workers_async(
+                "migrate_blocks", migrating_req.block_indexes,
+                migrating_req.context_parallel_config, target_block_indexes))
         self.engine_on_new_lifetime_event_callback(
             migrating_req.req.request_id,
             LifetimeEvent(LifetimeEventType.MigrationEnd)
